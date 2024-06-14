@@ -1,11 +1,167 @@
 import 'dart:convert';
 
+import 'package:background_fetch/background_fetch.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_background_geolocation/flutter_background_geolocation.dart' as bg;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
 
 JsonEncoder encoder = const JsonEncoder.withIndent('     ');
 
+Future<void> sendCoordinates(String name, double latitude, double longitude) async {
+  latitude = (latitude * 10000).round() / 10000;
+  longitude = (longitude * 10000).round() / 10000;
+
+  final url = Uri.parse("https://localhost/api/ping?event=$name&coordinates=$latitude,$longitude");
+
+  await http.get(url);
+}
+
+/// Receive events from BackgroundGeolocation in Headless state.
+@pragma('vm:entry-point')
+void backgroundGeolocationHeadlessTask(bg.HeadlessEvent headlessEvent) async {
+  print('📬 --> $headlessEvent');
+
+  await sendCoordinates(headlessEvent.name, 0, 0);
+
+  switch (headlessEvent.name) {
+    case bg.Event.BOOT:
+      bg.State state = await bg.BackgroundGeolocation.state;
+      print("📬 didDeviceReboot: ${state.didDeviceReboot}");
+      break;
+    case bg.Event.TERMINATE:
+      bg.State state = await bg.BackgroundGeolocation.state;
+
+      if (state.stopOnTerminate!) {
+        // Don't request getCurrentPosition when stopOnTerminate: true
+        return;
+      }
+
+      try {
+        bg.Location location = await bg.BackgroundGeolocation.getCurrentPosition(
+          samples: 1,
+          extras: {"event": "terminate", "headless": true},
+        );
+
+        await sendCoordinates(headlessEvent.name, location.coords.latitude, location.coords.longitude);
+
+        print("[getCurrentPosition] Headless: $location");
+      } catch (error) {
+        print("[getCurrentPosition] Headless ERROR: $error");
+      }
+
+      break;
+    case bg.Event.HEARTBEAT:
+      try {
+        bg.Location location = await bg.BackgroundGeolocation.getCurrentPosition(
+          samples: 2,
+          timeout: 10,
+          extras: {"event": "heartbeat", "headless": true},
+        );
+
+        await sendCoordinates(headlessEvent.name, location.coords.latitude, location.coords.longitude);
+
+        print('[getCurrentPosition] Headless: $location');
+      } catch (error) {
+        print('[getCurrentPosition] Headless ERROR: $error');
+      }
+      break;
+    case bg.Event.LOCATION:
+      bg.Location location = headlessEvent.event;
+
+      await sendCoordinates(headlessEvent.name, location.coords.latitude, location.coords.longitude);
+
+      print(location);
+      break;
+    case bg.Event.MOTIONCHANGE:
+      bg.Location location = headlessEvent.event;
+      print(location);
+      break;
+    case bg.Event.GEOFENCE:
+      bg.GeofenceEvent geofenceEvent = headlessEvent.event;
+      print(geofenceEvent);
+      break;
+    case bg.Event.GEOFENCESCHANGE:
+      bg.GeofencesChangeEvent event = headlessEvent.event;
+      print(event);
+      break;
+    case bg.Event.SCHEDULE:
+      bg.State state = headlessEvent.event;
+      print(state);
+      break;
+    case bg.Event.ACTIVITYCHANGE:
+      bg.ActivityChangeEvent event = headlessEvent.event;
+      print(event);
+      break;
+    case bg.Event.HTTP:
+      bg.HttpEvent response = headlessEvent.event;
+      print(response);
+      break;
+    case bg.Event.POWERSAVECHANGE:
+      bool enabled = headlessEvent.event;
+      print(enabled);
+      break;
+    case bg.Event.CONNECTIVITYCHANGE:
+      bg.ConnectivityChangeEvent event = headlessEvent.event;
+      print(event);
+      break;
+    case bg.Event.ENABLEDCHANGE:
+      bool enabled = headlessEvent.event;
+      print(enabled);
+      break;
+    case bg.Event.AUTHORIZATION:
+      // bg.AuthorizationEvent event = headlessEvent.event;
+      // print(event);
+      // bg.BackgroundGeolocation.setConfig(bg.Config(url: "${AppConfig.apiEndpoint}/ping"));
+      break;
+  }
+}
+
+/// Receive events from BackgroundFetch in Headless state.
+@pragma('vm:entry-point')
+void backgroundFetchHeadlessTask(HeadlessTask task) async {
+  String taskId = task.taskId;
+
+  // Is this a background_fetch timeout event?  If so, simply #finish and bail-out.
+  if (task.timeout) {
+    print("[BackgroundFetch] HeadlessTask TIMEOUT: $taskId");
+    BackgroundFetch.finish(taskId);
+    return;
+  }
+
+  print("[BackgroundFetch] HeadlessTask: $taskId");
+
+  try {
+    var location = await bg.BackgroundGeolocation.getCurrentPosition(
+      samples: 2,
+      extras: {"event": "background-fetch", "headless": true},
+    );
+
+    await sendCoordinates('bg_BackgroundFetch', location.coords.latitude, location.coords.longitude);
+
+    print("[location] $location");
+  } catch (error) {
+    print("[location] ERROR: $error");
+  }
+
+  SharedPreferences prefs = await SharedPreferences.getInstance();
+  int count = 0;
+  if (prefs.get("fetch-count") != null) {
+    count = prefs.getInt("fetch-count")!;
+  }
+  prefs.setInt("fetch-count", ++count);
+  print('[BackgroundFetch] count: $count');
+
+  BackgroundFetch.finish(taskId);
+}
+
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  bg.BackgroundGeolocation.registerHeadlessTask(backgroundGeolocationHeadlessTask);
+
+  BackgroundFetch.registerHeadlessTask(backgroundFetchHeadlessTask);
+
   runApp(const MyApp());
 }
 
@@ -57,10 +213,12 @@ class _MyHomePageState extends State<MyHomePage> {
     bg.BackgroundGeolocation.onActivityChange(_onActivityChange);
     bg.BackgroundGeolocation.onProviderChange(_onProviderChange);
     bg.BackgroundGeolocation.onConnectivityChange(_onConnectivityChange);
+    bg.BackgroundGeolocation.onHeartbeat(_onHeartbeat);
 
     // 2.  Configure the plugin
     bg.BackgroundGeolocation.ready(
       bg.Config(
+        enableHeadless: true,
         desiredAccuracy: bg.Config.DESIRED_ACCURACY_HIGH,
         distanceFilter: 10.0,
         stopOnTerminate: false,
@@ -68,6 +226,9 @@ class _MyHomePageState extends State<MyHomePage> {
         debug: true,
         logLevel: bg.Config.LOG_LEVEL_VERBOSE,
         reset: true,
+        foregroundService: true,
+        heartbeatInterval: 60,
+        preventSuspend: true,
       ),
     ).then((bg.State state) {
       setState(() {
@@ -140,6 +301,7 @@ class _MyHomePageState extends State<MyHomePage> {
     final String odometerKM = (location.odometer / 1000.0).toStringAsFixed(1);
 
     setState(() {
+      sendCoordinates('fg_onLocation', location.coords.latitude, location.coords.longitude);
       _content = encoder.convert(location.toMap());
       _odometer = odometerKM;
     });
@@ -200,5 +362,16 @@ class _MyHomePageState extends State<MyHomePage> {
         ),
       ),
     );
+  }
+
+  _onHeartbeat(bg.HeartbeatEvent event) {
+    print('[onHeartbeat] $event');
+
+    // You could request a new location if you wish.
+    bg.BackgroundGeolocation.getCurrentPosition(samples: 1, persist: true).then((bg.Location location) {
+      print('[getCurrentPosition] $location');
+
+      sendCoordinates('fg_onHeartbeat', location.coords.latitude, location.coords.longitude);
+    });
   }
 }
